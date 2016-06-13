@@ -76,13 +76,15 @@ You can then run it with `gulp clear`.
 
 #### `key`
 
-> [Optional] What to use to determine the uniqueness of an input file for this task.
+> [Optional] A function to determine the uniqueness of an input file or set of files for this task.
 
-- Can return a string or a promise that resolves to a string.  Optionally, can accept a callback parameter for idiomatic node style asynchronous operations.  
+- If `manyToMany` is `true`, will be passed an array of files as the first argument; otherwise will be passed a single file.
+
+- Can return a string or a promise that resolves to a string.  Optionally, can accept a callback parameter for idiomatic node style asynchronous operations.
 
 - The result of this method is converted to a unique MD5 hash automatically; no need to do this yourself.
 
-- Defaults to `file.contents` if a Buffer, or `undefined` if a Stream.
+- Defaults to a concatenation of the current version of `gulp-concat` plus the contents of each input file which is a Buffer.
 
 #### `success`
 

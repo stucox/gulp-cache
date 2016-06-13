@@ -12,37 +12,48 @@ var Transform = require('readable-stream/transform');
 var VERSION = require('./package.json').version;
 var fileCache = new Cache({cacheDirName: 'gulp-cache'});
 
-function defaultKey(file) {
-  return [VERSION, file.contents.toString('base64')].join('');
+function fileToObj(file) {
+  return objectPick(file, ['cwd', 'base', 'contents', 'stat', 'history', 'path']);
+}
+
+function restoreFileFromObj(obj) {
+  if (obj.contents) {
+    // Handle node 0.11 buffer to JSON as object with { type: 'buffer', data: [...] }
+    if (Array.isArray(obj.contents.data)) {
+      obj.contents = new Buffer(obj.contents.data);
+    } else if (Array.isArray(obj.contents)) {
+      obj.contents = new Buffer(obj.contents);
+    } else if (typeof obj.contents === 'string') {
+      obj.contents = new Buffer(obj.contents, 'base64');
+    }
+  }
+  var restoredFile = new File(obj);
+  var extraTaskProperties = objectOmit(obj, Object.keys(restoredFile));
+
+  // Restore any properties that the original task put on the file;
+  // but omit the normal properties of the file
+  return objectAssign(restoredFile, extraTaskProperties);
 }
 
 var defaultOptions = {
   fileCache: fileCache,
   name: 'default',
-  key: defaultKey,
-  restore: function(restored) {
-    if (restored.contents) {
-      // Handle node 0.11 buffer to JSON as object with { type: 'buffer', data: [...] }
-      if (restored && restored.contents && Array.isArray(restored.contents.data)) {
-        restored.contents = new Buffer(restored.contents.data);
-      } else if (Array.isArray(restored.contents)) {
-        restored.contents = new Buffer(restored.contents);
-      } else if (typeof restored.contents === 'string') {
-        restored.contents = new Buffer(restored.contents, 'base64');
-      }
-    }
-
-    var restoredFile = new File(restored);
-    var extraTaskProperties = objectOmit(restored, Object.keys(restoredFile));
-
-    // Restore any properties that the original task put on the file;
-    // but omit the normal properties of the file
-    return objectAssign(restoredFile, extraTaskProperties);
+  key: function defaultKey(fileOrFiles) {
+    // fileOrFiles is an array of files if manyToMany=true, otherwise just 1 file
+    var files = this.manyToMany ? fileOrFiles : [fileOrFiles];
+    var filesContents = files.map(function(file) {
+      return file.contents.toString('base64');
+    }).join('');
+    return [VERSION].concat(filesContents).join('');
+  },
+  manyToMany: false,
+  restore: function(value) {
+    return this.manyToMany ? value.map(restoreFileFromObj) : restoreFileFromObj(value);
   },
   success: true,
-  value: function(file) {
+  value: function(fileOrFiles) {
     // Convert from a File object (from vinyl) into a plain object
-    return objectPick(file, ['cwd', 'base', 'contents', 'stat', 'history', 'path']);
+    return this.manyToMany ? fileOrFiles.map(fileToObj) : fileToObj(fileOrFiles);
   }
 };
 
@@ -61,8 +72,26 @@ var cacheTask = function(task, opts) {
   // Make sure we have some sane defaults
   opts = objectAssign({}, cacheTask.defaultOptions, opts);
 
+  function processFiles(transform, files, cb) {
+    new TaskProxy({
+      task: task,
+      files: files,
+      opts: opts
+    })
+    .processFiles().then(function(outputFiles) {
+      // Emit each file in the outputFiles array
+      outputFiles.forEach(transform.push.bind(transform));
+      cb(null);
+    }, function(err) {
+      cb(new PluginError('gulp-cache', err));
+    });
+  }
+
+  var inputFiles = [];
+
   return new Transform({
     objectMode: true,
+    // Called per input file:
     transform: function(file, enc, cb) {
       if (file.isNull()) {
         cb(null, file);
@@ -74,16 +103,23 @@ var cacheTask = function(task, opts) {
         return;
       }
 
-      new TaskProxy({
-        task: task,
-        file: file,
-        opts: opts
-      })
-      .processFile().then(function(result) {
-        cb(null, result);
-      }, function(err) {
-        cb(new PluginError('gulp-cache', err));
-      });
+      if (opts.manyToMany) {
+        // Many-to-many mode: collect input files to process together
+        inputFiles.push(file);
+        cb();
+      } else {
+        // Single-file mode: process this file alone
+        processFiles(this, [file], cb);
+      }
+    },
+    // Called once all files have been recieved:
+    flush: function(cb) {
+      // In many-to-many mode, pass all input files together
+      if (opts.manyToMany) {
+        processFiles(this, inputFiles, cb);
+      } else {
+        cb();
+      }
     }
   });
 };
@@ -91,8 +127,27 @@ var cacheTask = function(task, opts) {
 cacheTask.clear = function(opts) {
   opts = objectAssign({}, cacheTask.defaultOptions, opts);
 
+  function removeFiles(transform, files, cb) {
+    new TaskProxy({
+      task: null,
+      files: files,
+      opts: opts
+    })
+    .removeCachedResult().then(function() {
+      // Backward compatibility: consumers may use .on('data')
+      // to determine when task is complete
+      transform.push(files[0]);
+      cb();
+    }).catch(function(err) {
+      cb(new PluginError('gulp-cache', err));
+    });
+  }
+
+  var inputFiles = [];
+
   return new Transform({
     objectMode: true,
+    // Called per input file:
     transform: function(file, enc, cb) {
       if (file.isNull()) {
         cb(null, file);
@@ -104,17 +159,23 @@ cacheTask.clear = function(opts) {
         return;
       }
 
-      var taskProxy = new TaskProxy({
-        task: null,
-        file: file,
-        opts: opts
-      });
-
-      taskProxy.removeCachedResult().then(function() {
-        cb(null, file);
-      }).catch(function(err) {
-        cb(new PluginError('gulp-cache', err));
-      });
+      if (opts.manyToMany) {
+        // Many-to-many mode: collect input files to process together
+        inputFiles.push(file);
+        cb();
+      } else {
+        // Single-file mode: process this file alone
+        removeFiles(this, [file], cb);
+      }
+    },
+    // Called once all files have been recieved:
+    flush: function(cb) {
+      // In many-to-many mode, pass all input files together
+      if (opts.manyToMany) {
+        removeFiles(this, inputFiles, cb);
+      } else {
+        cb();
+      }
     }
   });
 };
